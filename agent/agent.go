@@ -8,25 +8,33 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/shipany-ai/open-agent-sdk-go/api"
-	"github.com/shipany-ai/open-agent-sdk-go/costtracker"
-	"github.com/shipany-ai/open-agent-sdk-go/hooks"
-	"github.com/shipany-ai/open-agent-sdk-go/mcp"
-	"github.com/shipany-ai/open-agent-sdk-go/permissions"
-	"github.com/shipany-ai/open-agent-sdk-go/tools"
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/api"
+	"github.com/codeany-ai/open-agent-sdk-go/costtracker"
+	"github.com/codeany-ai/open-agent-sdk-go/hooks"
+	"github.com/codeany-ai/open-agent-sdk-go/mcp"
+	"github.com/codeany-ai/open-agent-sdk-go/permissions"
+	"github.com/codeany-ai/open-agent-sdk-go/tools"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 const (
 	defaultMaxTurns = 100
 )
 
+// ThinkingConfig configures extended thinking.
+type ThinkingConfig struct {
+	// Type must be "enabled" to activate thinking.
+	Type string `json:"type"`
+	// BudgetTokens is the max number of thinking tokens.
+	BudgetTokens int `json:"budget_tokens"`
+}
+
 // Options configures an Agent.
 type Options struct {
-	// Model ID (e.g. "claude-sonnet-4-6")
+	// Model ID (e.g. "sonnet-4-6")
 	Model string
 
-	// Anthropic API key
+	// API key
 	APIKey string
 
 	// API base URL override
@@ -67,6 +75,32 @@ type Options struct {
 
 	// Environment variables (for API key, model, etc.)
 	Env map[string]string
+
+	// Extended thinking configuration
+	Thinking *ThinkingConfig
+
+	// Structured output JSON schema name and schema
+	JSONSchema map[string]interface{}
+
+	// Custom HTTP headers
+	CustomHeaders map[string]string
+
+	// Proxy URL for API requests
+	ProxyURL string
+
+	// API timeout in milliseconds
+	TimeoutMs int
+
+	// Subagent definitions
+	Agents map[string]AgentDefinition
+}
+
+// AgentDefinition defines a subagent configuration.
+type AgentDefinition struct {
+	Description  string   `json:"description"`
+	Instructions string   `json:"instructions"`
+	Tools        []string `json:"tools,omitempty"`
+	Model        string   `json:"model,omitempty"`
 }
 
 // Agent is the main agent that runs the agentic loop.
@@ -84,27 +118,24 @@ type Agent struct {
 
 // New creates a new Agent.
 func New(opts Options) *Agent {
-	// Resolve from env map
 	resolveEnvOptions(&opts)
 
 	sessionID := uuid.New().String()
 
-	// Create API client
 	apiClient := api.NewClient(api.ClientConfig{
-		APIKey:  opts.APIKey,
-		BaseURL: opts.BaseURL,
-		Model:   opts.Model,
+		APIKey:        opts.APIKey,
+		BaseURL:       opts.BaseURL,
+		Model:         opts.Model,
+		CustomHeaders: opts.CustomHeaders,
+		ProxyURL:      opts.ProxyURL,
+		TimeoutMs:     opts.TimeoutMs,
 	})
 
-	// Create tool registry
 	registry := tools.DefaultRegistry()
-
-	// Add custom tools
 	for _, t := range opts.CustomTools {
 		registry.Register(t)
 	}
 
-	// Create permission handler
 	permConfig := &permissions.Config{Mode: opts.PermissionMode}
 	if permConfig.Mode == "" {
 		permConfig.Mode = types.PermissionModeBypassPermissions
@@ -114,7 +145,6 @@ func New(opts Options) *Agent {
 		canUseTool = permissions.NewCanUseToolFn(permConfig, opts.AllowedTools)
 	}
 
-	// Create hook manager
 	hookManager := hooks.NewManager(opts.Hooks)
 
 	a := &Agent{
@@ -144,7 +174,6 @@ func (a *Agent) Init(ctx context.Context) error {
 			continue
 		}
 
-		// Register MCP tools
 		mcpTools := mcp.ToolsFromConnection(conn)
 		for _, t := range mcpTools {
 			a.toolRegistry.Register(t)
@@ -194,7 +223,9 @@ func (a *Agent) Prompt(ctx context.Context, prompt string) (*QueryResult, error)
 		switch event.Type {
 		case types.MessageTypeAssistant:
 			if event.Message != nil {
-				lastAssistantText = types.ExtractText(event.Message)
+				if text := types.ExtractText(event.Message); text != "" {
+					lastAssistantText = text
+				}
 			}
 		case types.MessageTypeResult:
 			if event.Usage != nil {
@@ -205,7 +236,6 @@ func (a *Agent) Prompt(ctx context.Context, prompt string) (*QueryResult, error)
 		}
 	}
 
-	// Check for errors
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -236,45 +266,47 @@ func (a *Agent) Close() {
 	a.mcpClient.Close()
 }
 
-// resolveEnvOptions resolves options from env map and process environment.
+// SessionID returns the current session ID.
+func (a *Agent) SessionID() string {
+	return a.sessionID
+}
+
+// CostTracker returns the cost tracker.
+func (a *Agent) CostTracker() *costtracker.Tracker {
+	return a.costTracker
+}
+
+// envFirst returns the first non-empty value from the env map or os env,
+// trying CODEANY_ prefix first, then ANTHROPIC_ for compatibility.
+func envFirst(env map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if env != nil {
+			if v := env[key]; v != "" {
+				return v
+			}
+		}
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func resolveEnvOptions(opts *Options) {
 	env := opts.Env
 
 	if opts.APIKey == "" {
-		if env != nil {
-			if v := env["ANTHROPIC_API_KEY"]; v != "" {
-				opts.APIKey = v
-			} else if v := env["ANTHROPIC_AUTH_TOKEN"]; v != "" {
-				opts.APIKey = v
-			}
-		}
-		if opts.APIKey == "" {
-			opts.APIKey = os.Getenv("ANTHROPIC_API_KEY")
-		}
+		opts.APIKey = envFirst(env, "CODEANY_API_KEY", "ANTHROPIC_API_KEY", "CODEANY_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
 	}
 
 	if opts.BaseURL == "" {
-		if env != nil {
-			if v := env["ANTHROPIC_BASE_URL"]; v != "" {
-				opts.BaseURL = v
-			}
-		}
-		if opts.BaseURL == "" {
-			opts.BaseURL = os.Getenv("ANTHROPIC_BASE_URL")
-		}
+		opts.BaseURL = envFirst(env, "CODEANY_BASE_URL", "ANTHROPIC_BASE_URL")
 	}
 
 	if opts.Model == "" {
-		if env != nil {
-			if v := env["ANTHROPIC_MODEL"]; v != "" {
-				opts.Model = v
-			}
-		}
+		opts.Model = envFirst(env, "CODEANY_MODEL", "ANTHROPIC_MODEL")
 		if opts.Model == "" {
-			opts.Model = os.Getenv("ANTHROPIC_MODEL")
-		}
-		if opts.Model == "" {
-			opts.Model = "claude-sonnet-4-6"
+			opts.Model = "sonnet-4-6"
 		}
 	}
 

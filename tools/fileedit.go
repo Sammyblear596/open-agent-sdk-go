@@ -6,11 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/tools/diff"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
-// FileEditTool performs string replacements in files.
+// FileEditTool performs string replacements in files with diff generation,
+// staleness detection, and line ending preservation.
 type FileEditTool struct{}
 
 func NewFileEditTool() *FileEditTool { return &FileEditTool{} }
@@ -18,8 +21,13 @@ func NewFileEditTool() *FileEditTool { return &FileEditTool{} }
 func (t *FileEditTool) Name() string { return "Edit" }
 
 func (t *FileEditTool) Description() string {
-	return `Performs exact string replacements in files. The old_string must be unique in the file
-unless replace_all is set to true. Use this tool for making targeted changes to existing files.`
+	return `Performs exact string replacements in files.
+
+Usage:
+- You must use the Read tool at least once before editing a file.
+- The edit will FAIL if old_string is not unique in the file. Provide more context or use replace_all.
+- Preserve exact indentation as it appears in the file.
+- old_string and new_string must be different.`
 }
 
 func (t *FileEditTool) InputSchema() types.ToolInputSchema {
@@ -36,11 +44,12 @@ func (t *FileEditTool) InputSchema() types.ToolInputSchema {
 			},
 			"new_string": map[string]interface{}{
 				"type":        "string",
-				"description": "The replacement text",
+				"description": "The replacement text (must be different from old_string)",
 			},
 			"replace_all": map[string]interface{}{
 				"type":        "boolean",
 				"description": "Replace all occurrences (default false)",
+				"default":     false,
 			},
 		},
 		Required: []string{"file_path", "old_string", "new_string"},
@@ -57,16 +66,15 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 	replaceAll, _ := input["replace_all"].(bool)
 
 	if filePath == "" {
-		return &types.ToolResult{IsError: true, Error: "file_path is required"}, nil
+		return errorResult("file_path is required"), nil
 	}
 	if oldString == "" {
-		return &types.ToolResult{IsError: true, Error: "old_string is required"}, nil
+		return errorResult("old_string is required"), nil
 	}
 	if oldString == newString {
-		return &types.ToolResult{IsError: true, Error: "old_string and new_string must be different"}, nil
+		return errorResult("old_string and new_string must be different"), nil
 	}
 
-	// Resolve relative paths
 	if !filepath.IsAbs(filePath) && tCtx != nil && tCtx.WorkingDir != "" {
 		filePath = filepath.Join(tCtx.WorkingDir, filePath)
 	}
@@ -75,30 +83,61 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &types.ToolResult{
-				IsError: true,
-				Error:   fmt.Sprintf("File does not exist: %s", filePath),
-			}, nil
+			return errorResult(fmt.Sprintf("File does not exist: %s", filePath)), nil
 		}
-		return &types.ToolResult{IsError: true, Error: err.Error()}, nil
+		return errorResult(err.Error()), nil
+	}
+
+	// File size check
+	if len(data) > maxFileSize {
+		return errorResult(fmt.Sprintf("File is too large (%d bytes, max %d)", len(data), maxFileSize)), nil
 	}
 
 	content := string(data)
+	originalContent := content
+
+	// Detect line ending style
+	lineEnding := detectLineEnding(content)
+
+	// Staleness check
+	if tCtx != nil && tCtx.ReadFileState != nil {
+		if state, ok := tCtx.ReadFileState[filePath]; ok {
+			if state.Content != content {
+				info, _ := os.Stat(filePath)
+				if info != nil {
+					modTime := info.ModTime().UnixMilli()
+					if modTime > state.Timestamp {
+						return errorResult(fmt.Sprintf(
+							"File %s has been modified since last read (read at %d, modified at %d). Please re-read the file before editing.",
+							filePath, state.Timestamp, modTime)), nil
+					}
+				}
+			}
+		}
+	}
 
 	// Count occurrences
 	count := strings.Count(content, oldString)
 	if count == 0 {
-		return &types.ToolResult{
-			IsError: true,
-			Error:   fmt.Sprintf("old_string not found in %s. Make sure the string matches exactly, including whitespace and indentation.", filePath),
-		}, nil
+		// Try with normalized quotes
+		normalizedOld := normalizeQuotes(oldString)
+		normalizedContent := normalizeQuotes(content)
+		count = strings.Count(normalizedContent, normalizedOld)
+		if count > 0 {
+			return errorResult(fmt.Sprintf(
+				"old_string not found with exact match, but found %d match(es) with normalized quotes. "+
+					"Make sure you're using the same quote style as the file.", count)), nil
+		}
+		return errorResult(fmt.Sprintf(
+			"old_string not found in %s. Make sure the string matches exactly, including whitespace and indentation.",
+			filePath)), nil
 	}
 
 	if count > 1 && !replaceAll {
-		return &types.ToolResult{
-			IsError: true,
-			Error:   fmt.Sprintf("old_string found %d times in %s. Use replace_all=true to replace all occurrences, or provide more context to make the match unique.", count, filePath),
-		}, nil
+		return errorResult(fmt.Sprintf(
+			"old_string found %d times in %s. Use replace_all=true to replace all occurrences, "+
+				"or provide more context to make the match unique.",
+			count, filePath)), nil
 	}
 
 	// Perform replacement
@@ -109,12 +148,24 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 		newContent = strings.Replace(content, oldString, newString, 1)
 	}
 
+	// Preserve line endings
+	if lineEnding == "\r\n" && !strings.Contains(newString, "\r\n") {
+		newContent = strings.ReplaceAll(newContent, "\n", "\r\n")
+		// But don't double-convert \r\n
+		newContent = strings.ReplaceAll(newContent, "\r\r\n", "\r\n")
+	}
+
 	// Write back
 	if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
-		return &types.ToolResult{
-			IsError: true,
-			Error:   fmt.Sprintf("Failed to write file: %v", err),
-		}, nil
+		return errorResult(fmt.Sprintf("Failed to write file: %v", err)), nil
+	}
+
+	// Update file state cache
+	if tCtx != nil && tCtx.ReadFileState != nil {
+		tCtx.ReadFileState[filePath] = &types.FileReadState{
+			Content:   newContent,
+			Timestamp: time.Now().UnixMilli(),
+		}
 	}
 
 	replacements := 1
@@ -122,14 +173,44 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 		replacements = count
 	}
 
+	// Generate unified diff
+	patch := diff.UnifiedDiff(filePath, originalContent, newContent)
+
 	return &types.ToolResult{
 		Data: map[string]interface{}{
 			"filePath":     filePath,
 			"replacements": replacements,
+			"oldString":    oldString,
+			"newString":    newString,
+			"replaceAll":   replaceAll,
+			"patch":        patch,
 		},
 		Content: []types.ContentBlock{{
 			Type: types.ContentBlockText,
-			Text: fmt.Sprintf("Successfully edited %s (%d replacement(s))", filePath, replacements),
+			Text: fmt.Sprintf("Successfully edited %s (%d replacement(s) made)", filePath, replacements),
 		}},
 	}, nil
+}
+
+// detectLineEnding detects the predominant line ending style.
+func detectLineEnding(content string) string {
+	crlfCount := strings.Count(content, "\r\n")
+	lfCount := strings.Count(content, "\n") - crlfCount
+	if crlfCount > lfCount {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+// normalizeQuotes normalizes curly/smart quotes to straight quotes.
+func normalizeQuotes(s string) string {
+	replacer := strings.NewReplacer(
+		"\u2018", "'", // left single
+		"\u2019", "'", // right single
+		"\u201C", "\"", // left double
+		"\u201D", "\"", // right double
+		"\u2013", "-", // en dash
+		"\u2014", "-", // em dash
+	)
+	return replacer.Replace(s)
 }

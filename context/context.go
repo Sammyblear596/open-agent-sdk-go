@@ -18,7 +18,7 @@ type SystemContext struct {
 
 // UserContext holds user-level context for the agent.
 type UserContext struct {
-	ClaudeMD    string `json:"claudeMd,omitempty"`
+	ProjectMD    string `json:"projectMd,omitempty"`
 	CurrentDate string `json:"currentDate,omitempty"`
 }
 
@@ -44,7 +44,7 @@ func GetSystemContext(cwd string) *SystemContext {
 func GetUserContext(cwd string) *UserContext {
 	userContextOnce.Do(func() {
 		userContext = &UserContext{
-			ClaudeMD:    loadClaudeMD(cwd),
+			ProjectMD:    loadProjectMD(cwd),
 			CurrentDate: fmt.Sprintf("Today's date is %s.", time.Now().Format("2006-01-02")),
 		}
 	})
@@ -81,8 +81,8 @@ func BuildSystemPromptBlocks(systemPrompt string, sysCtx *SystemContext, userCtx
 		if userCtx.CurrentDate != "" {
 			contextParts = append(contextParts, userCtx.CurrentDate)
 		}
-		if userCtx.ClaudeMD != "" {
-			contextParts = append(contextParts, userCtx.ClaudeMD)
+		if userCtx.ProjectMD != "" {
+			contextParts = append(contextParts, userCtx.ProjectMD)
 		}
 		if len(contextParts) > 0 {
 			blocks = append(blocks, map[string]interface{}{
@@ -145,17 +145,17 @@ func gitCmd(cwd string, args ...string) string {
 	return strings.TrimSpace(out.String())
 }
 
-func loadClaudeMD(cwd string) string {
-	// Check for CLAUDE.md in the project root
+func loadProjectMD(cwd string) string {
+	// Check for CODEANY.md in the project root
 	candidates := []string{
-		filepath.Join(cwd, "CLAUDE.md"),
-		filepath.Join(cwd, ".claude", "CLAUDE.md"),
+		filepath.Join(cwd, "CODEANY.md"),
+		filepath.Join(cwd, ".codeany", "CODEANY.md"),
 	}
 
 	// Also check home directory
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates,
-			filepath.Join(home, ".claude", "CLAUDE.md"),
+			filepath.Join(home, ".codeany", "CODEANY.md"),
 		)
 	}
 

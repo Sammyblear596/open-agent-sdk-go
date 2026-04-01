@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // MessageType represents the kind of message in a conversation.
 type MessageType string
@@ -42,6 +45,48 @@ type ContentBlock struct {
 
 	// For thinking
 	Thinking string `json:"thinking,omitempty"`
+}
+
+// MarshalJSON customizes JSON serialization per block type.
+// Ensures tool_use blocks always include "input" (even if empty).
+func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case ContentBlockToolUse:
+		input := b.Input
+		if input == nil {
+			input = map[string]interface{}{}
+		}
+		return json.Marshal(struct {
+			Type  ContentBlockType       `json:"type"`
+			ID    string                 `json:"id"`
+			Name  string                 `json:"name"`
+			Input map[string]interface{} `json:"input"`
+		}{b.Type, b.ID, b.Name, input})
+
+	case ContentBlockToolResult:
+		m := map[string]interface{}{
+			"type":        b.Type,
+			"tool_use_id": b.ToolUseID,
+		}
+		if b.IsError {
+			m["is_error"] = true
+		}
+		if len(b.Content) > 0 {
+			m["content"] = b.Content
+		}
+		return json.Marshal(m)
+
+	case ContentBlockText:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{string(b.Type), b.Text})
+
+	default:
+		// Fallback: use a type alias to avoid recursion
+		type Alias ContentBlock
+		return json.Marshal((*Alias)(&b))
+	}
 }
 
 // ImageSource represents an inline image.

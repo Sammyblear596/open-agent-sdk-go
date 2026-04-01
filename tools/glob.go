@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 const globMaxResults = 100

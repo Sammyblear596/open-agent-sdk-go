@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 // ModelUsage tracks usage for a specific model.
@@ -25,6 +26,17 @@ type Tracker struct {
 	totalCostUSD float64
 	modelUsage   map[string]*ModelUsage
 	sessionID    string
+
+	// Duration tracking
+	totalAPIDuration    time.Duration
+	totalToolDuration   time.Duration
+
+	// Code change tracking
+	totalLinesAdded   int
+	totalLinesRemoved int
+
+	// Web search counting
+	totalWebSearchRequests int
 }
 
 // NewTracker creates a new cost tracker.
@@ -39,10 +51,10 @@ func NewTracker(sessionID string) *Tracker {
 var modelPricing = map[string]struct {
 	inputPerM, outputPerM, cacheReadPerM, cacheWritePerM float64
 }{
-	"claude-sonnet-4-6":   {3.0, 15.0, 0.3, 3.75},
-	"claude-opus-4-6":     {15.0, 75.0, 1.5, 18.75},
-	"claude-haiku-4-5":    {0.8, 4.0, 0.08, 1.0},
-	"claude-sonnet-4-5":   {3.0, 15.0, 0.3, 3.75},
+	"sonnet-4-6":   {3.0, 15.0, 0.3, 3.75},
+	"opus-4-6":     {15.0, 75.0, 1.5, 18.75},
+	"haiku-4-5":    {0.8, 4.0, 0.08, 1.0},
+	"sonnet-4-5":   {3.0, 15.0, 0.3, 3.75},
 }
 
 // AddUsage records token usage and cost for a model.
@@ -176,11 +188,64 @@ func (t *Tracker) Restore(configDir string) error {
 	return nil
 }
 
+// AddAPIDuration records API call duration.
+func (t *Tracker) AddAPIDuration(d time.Duration) {
+	t.mu.Lock()
+	t.totalAPIDuration += d
+	t.mu.Unlock()
+}
+
+// AddToolDuration records tool execution duration.
+func (t *Tracker) AddToolDuration(d time.Duration) {
+	t.mu.Lock()
+	t.totalToolDuration += d
+	t.mu.Unlock()
+}
+
+// AddCodeChanges records lines added and removed.
+func (t *Tracker) AddCodeChanges(added, removed int) {
+	t.mu.Lock()
+	t.totalLinesAdded += added
+	t.totalLinesRemoved += removed
+	t.mu.Unlock()
+}
+
+// AddWebSearchRequest increments the web search counter.
+func (t *Tracker) AddWebSearchRequest() {
+	t.mu.Lock()
+	t.totalWebSearchRequests++
+	t.mu.Unlock()
+}
+
+// Stats returns a summary of all tracked metrics.
+func (t *Tracker) Stats() map[string]interface{} {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	inputTokens, outputTokens := 0, 0
+	for _, mu := range t.modelUsage {
+		inputTokens += mu.InputTokens
+		outputTokens += mu.OutputTokens
+	}
+
+	return map[string]interface{}{
+		"totalCostUSD":        t.totalCostUSD,
+		"totalInputTokens":    inputTokens,
+		"totalOutputTokens":   outputTokens,
+		"totalAPIDurationMs":  t.totalAPIDuration.Milliseconds(),
+		"totalToolDurationMs": t.totalToolDuration.Milliseconds(),
+		"totalLinesAdded":     t.totalLinesAdded,
+		"totalLinesRemoved":   t.totalLinesRemoved,
+		"totalWebSearches":    t.totalWebSearchRequests,
+		"modelUsage":          t.modelUsage,
+	}
+}
+
 func calculateCost(model string, usage *types.Usage) float64 {
 	pricing, ok := modelPricing[model]
 	if !ok {
 		// Default to sonnet pricing
-		pricing = modelPricing["claude-sonnet-4-6"]
+		pricing = modelPricing["sonnet-4-6"]
 	}
 
 	cost := float64(usage.InputTokens) * pricing.inputPerM / 1_000_000

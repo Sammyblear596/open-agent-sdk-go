@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 // ToolCallRequest represents a pending tool call.

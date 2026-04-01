@@ -8,57 +8,143 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/google/uuid"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 const (
 	defaultBaseURL   = "https://api.anthropic.com"
-	defaultModel     = "claude-sonnet-4-6"
+	defaultModel     = "sonnet-4-6"
 	apiVersion       = "2023-06-01"
 	defaultMaxTokens = 16384
+	maxRetries       = 3
 )
 
-// ClientConfig configures the Anthropic API client.
-type ClientConfig struct {
-	APIKey     string
-	BaseURL    string
-	Model      string
-	MaxTokens  int
-	HTTPClient *http.Client
+// ModelConfig holds per-model configuration.
+type ModelConfig struct {
+	MaxOutputTokens int
+	ContextWindow   int
 }
 
-// Client communicates with the Anthropic Messages API.
+// Known model configurations.
+var modelConfigs = map[string]ModelConfig{
+	"opus-4-6":    {MaxOutputTokens: 32768, ContextWindow: 1048576},
+	"sonnet-4-6":  {MaxOutputTokens: 16384, ContextWindow: 200000},
+	"haiku-4-5":   {MaxOutputTokens: 8192, ContextWindow: 200000},
+	"sonnet-4-5":  {MaxOutputTokens: 16384, ContextWindow: 200000},
+}
+
+// GetModelConfig returns configuration for a model.
+func GetModelConfig(model string) ModelConfig {
+	if cfg, ok := modelConfigs[model]; ok {
+		return cfg
+	}
+	return ModelConfig{MaxOutputTokens: defaultMaxTokens, ContextWindow: 200000}
+}
+
+// ClientConfig configures the API client.
+type ClientConfig struct {
+	APIKey        string
+	BaseURL       string
+	Model         string
+	MaxTokens     int
+	HTTPClient    *http.Client
+	CustomHeaders map[string]string
+	ProxyURL      string
+	TimeoutMs     int
+}
+
+// Client communicates with the Messages API.
 type Client struct {
 	config ClientConfig
 }
 
-// NewClient creates a new Anthropic API client.
+// envOr returns the first non-empty value from environment variables,
+// trying CODEANY_ prefix first then ANTHROPIC_ for compatibility.
+func envOr(keys ...string) string {
+	for _, key := range keys {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// NewClient creates an API client.
 func NewClient(config ClientConfig) *Client {
 	if config.APIKey == "" {
-		config.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+		config.APIKey = envOr("CODEANY_API_KEY", "ANTHROPIC_API_KEY")
 	}
 	if config.BaseURL == "" {
-		config.BaseURL = os.Getenv("ANTHROPIC_BASE_URL")
+		config.BaseURL = envOr("CODEANY_BASE_URL", "ANTHROPIC_BASE_URL")
 		if config.BaseURL == "" {
 			config.BaseURL = defaultBaseURL
 		}
 	}
 	if config.Model == "" {
-		config.Model = os.Getenv("ANTHROPIC_MODEL")
+		config.Model = envOr("CODEANY_MODEL", "ANTHROPIC_MODEL")
 		if config.Model == "" {
 			config.Model = defaultModel
 		}
 	}
 	if config.MaxTokens == 0 {
-		config.MaxTokens = defaultMaxTokens
+		cfg := GetModelConfig(config.Model)
+		config.MaxTokens = cfg.MaxOutputTokens
 	}
+
+	// Parse custom headers from env
+	if config.CustomHeaders == nil {
+		config.CustomHeaders = make(map[string]string)
+	}
+	if envHeaders := envOr("CODEANY_CUSTOM_HEADERS", "ANTHROPIC_CUSTOM_HEADERS"); envHeaders != "" {
+		for _, pair := range strings.Split(envHeaders, ",") {
+			parts := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+			if len(parts) == 2 {
+				config.CustomHeaders[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	// Build HTTP client
+	timeout := 10 * time.Minute
+	if config.TimeoutMs > 0 {
+		timeout = time.Duration(config.TimeoutMs) * time.Millisecond
+	} else if envTimeout := os.Getenv("API_TIMEOUT_MS"); envTimeout != "" {
+		var ms int
+		fmt.Sscanf(envTimeout, "%d", &ms)
+		if ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	if config.HTTPClient == nil {
-		config.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+
+		// Proxy support
+		proxyURL := config.ProxyURL
+		if proxyURL == "" {
+			proxyURL = os.Getenv("HTTPS_PROXY")
+		}
+		if proxyURL == "" {
+			proxyURL = os.Getenv("HTTP_PROXY")
+		}
+		if proxyURL != "" {
+			if u, err := url.Parse(proxyURL); err == nil {
+				transport.Proxy = http.ProxyURL(u)
+			}
+		}
+
+		config.HTTPClient = &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		}
 	}
+
 	return &Client{config: config}
 }
 
@@ -70,31 +156,36 @@ type APIMessage struct {
 
 // APIToolParam is a tool definition for the API.
 type APIToolParam struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"input_schema"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]interface{} `json:"input_schema"`
+	CacheControl *CacheControl          `json:"cache_control,omitempty"`
 }
 
 // MessagesRequest is the request body for the Messages API.
 type MessagesRequest struct {
-	Model     string                   `json:"model"`
-	MaxTokens int                      `json:"max_tokens"`
-	System    []SystemBlock            `json:"system,omitempty"`
-	Messages  []APIMessage             `json:"messages"`
-	Tools     []APIToolParam           `json:"tools,omitempty"`
-	Stream    bool                     `json:"stream"`
-	Metadata  map[string]interface{}   `json:"metadata,omitempty"`
-	StopSequences []string             `json:"stop_sequences,omitempty"`
-	Temperature   *float64             `json:"temperature,omitempty"`
+	Model         string                 `json:"model"`
+	MaxTokens     int                    `json:"max_tokens"`
+	System        []SystemBlock          `json:"system,omitempty"`
+	Messages      []APIMessage           `json:"messages"`
+	Tools         []APIToolParam         `json:"tools,omitempty"`
+	Stream        bool                   `json:"stream"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	TopP          *float64               `json:"top_p,omitempty"`
 
 	// Extended thinking
 	Thinking *ThinkingConfig `json:"thinking,omitempty"`
+
+	// Structured output
+	ToolChoice interface{} `json:"tool_choice,omitempty"`
 }
 
 // SystemBlock is a system prompt block.
 type SystemBlock struct {
-	Type         string `json:"type"`
-	Text         string `json:"text"`
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
@@ -127,19 +218,37 @@ type StreamEvent struct {
 
 // StreamMessage is the message object in a message_start event.
 type StreamMessage struct {
-	ID         string              `json:"id"`
-	Type       string              `json:"type"`
-	Role       string              `json:"role"`
-	Content    []types.ContentBlock `json:"content"`
-	Model      string              `json:"model"`
-	StopReason string              `json:"stop_reason"`
-	Usage      *types.Usage        `json:"usage"`
+	ID         string               `json:"id"`
+	Type       string               `json:"type"`
+	Role       string               `json:"role"`
+	Content    []types.ContentBlock  `json:"content"`
+	Model      string               `json:"model"`
+	StopReason string               `json:"stop_reason"`
+	Usage      *types.Usage         `json:"usage"`
 }
 
 // StreamCallback is called for each streaming event.
 type StreamCallback func(event StreamEvent) error
 
-// CreateMessageStream sends a streaming messages request and calls the callback for each event.
+// buildBetaHeaders returns the appropriate beta headers based on the request.
+func (c *Client) buildBetaHeaders(req MessagesRequest) string {
+	var betas []string
+	betas = append(betas, "prompt-caching-2024-07-31")
+
+	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		betas = append(betas, "interleaved-thinking-2025-05-14")
+	}
+
+	// Check model context window for 1M beta
+	cfg := GetModelConfig(req.Model)
+	if cfg.ContextWindow >= 1000000 {
+		betas = append(betas, "context-1m-20250901")
+	}
+
+	return strings.Join(betas, ",")
+}
+
+// CreateMessageStream sends a streaming messages request.
 func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (<-chan StreamEvent, <-chan error) {
 	eventCh := make(chan StreamEvent, 64)
 	errCh := make(chan error, 1)
@@ -162,24 +271,60 @@ func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (
 			return
 		}
 
-		url := strings.TrimRight(c.config.BaseURL, "/") + "/v1/messages"
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			errCh <- fmt.Errorf("create request: %w", err)
-			return
+		apiURL := strings.TrimRight(c.config.BaseURL, "/") + "/v1/messages"
+		requestID := uuid.New().String()
+
+		// Retry logic for transient errors
+		var resp *http.Response
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+			}
+
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
+			if err != nil {
+				errCh <- fmt.Errorf("create request: %w", err)
+				return
+			}
+
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-API-Key", c.config.APIKey)
+			httpReq.Header.Set("Anthropic-Version", apiVersion)
+			httpReq.Header.Set("Anthropic-Beta", c.buildBetaHeaders(req))
+			httpReq.Header.Set("Accept", "text/event-stream")
+			httpReq.Header.Set("X-Client-Request-Id", requestID)
+
+			// Custom headers
+			for k, v := range c.config.CustomHeaders {
+				httpReq.Header.Set(k, v)
+			}
+
+			resp, err = c.config.HTTPClient.Do(httpReq)
+			if err != nil {
+				if attempt < maxRetries && isRetryableError(err) {
+					continue
+				}
+				errCh <- fmt.Errorf("send request: %w", err)
+				return
+			}
+
+			// Retry on server errors and rate limits
+			if resp.StatusCode == 429 || resp.StatusCode == 529 || resp.StatusCode >= 500 {
+				io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if attempt < maxRetries {
+					continue
+				}
+			}
+			break
 		}
 
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("X-API-Key", c.config.APIKey)
-		httpReq.Header.Set("Anthropic-Version", apiVersion)
-		httpReq.Header.Set("Anthropic-Beta", "prompt-caching-2024-07-31")
-		httpReq.Header.Set("Accept", "text/event-stream")
-
-		resp, err := c.config.HTTPClient.Do(httpReq)
-		if err != nil {
-			errCh <- fmt.Errorf("send request: %w", err)
-			return
-		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
@@ -189,7 +334,7 @@ func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -205,7 +350,7 @@ func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (
 
 			var event StreamEvent
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
-				continue // Skip malformed events
+				continue
 			}
 
 			select {
@@ -239,19 +384,46 @@ func (c *Client) CreateMessage(ctx context.Context, req MessagesRequest) (*Strea
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := strings.TrimRight(c.config.BaseURL, "/") + "/v1/messages"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
+	apiURL := strings.TrimRight(c.config.BaseURL, "/") + "/v1/messages"
+	requestID := uuid.New().String()
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-API-Key", c.config.APIKey)
-	httpReq.Header.Set("Anthropic-Version", apiVersion)
+	var resp *http.Response
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*attempt) * time.Second)
+		}
 
-	resp, err := c.config.HTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("X-API-Key", c.config.APIKey)
+		httpReq.Header.Set("Anthropic-Version", apiVersion)
+		httpReq.Header.Set("Anthropic-Beta", c.buildBetaHeaders(req))
+		httpReq.Header.Set("X-Client-Request-Id", requestID)
+
+		for k, v := range c.config.CustomHeaders {
+			httpReq.Header.Set(k, v)
+		}
+
+		resp, err = c.config.HTTPClient.Do(httpReq)
+		if err != nil {
+			if attempt < maxRetries && isRetryableError(err) {
+				continue
+			}
+			return nil, fmt.Errorf("send request: %w", err)
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode == 529 || resp.StatusCode >= 500 {
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if attempt < maxRetries {
+				continue
+			}
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -272,6 +444,17 @@ func (c *Client) CreateMessage(ctx context.Context, req MessagesRequest) (*Strea
 	return &msg, nil
 }
 
+// isRetryableError checks if an error is transient and retryable.
+func isRetryableError(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "TLS handshake timeout") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "i/o timeout")
+}
+
 // ToolToAPIParam converts a Tool to an API tool parameter.
 func ToolToAPIParam(t types.Tool) APIToolParam {
 	schema := t.InputSchema()
@@ -290,4 +473,11 @@ func ToolToAPIParam(t types.Tool) APIToolParam {
 		Description: t.Description(),
 		InputSchema: schemaMap,
 	}
+}
+
+// ToolToAPIParamWithCache creates a tool parameter with cache control.
+func ToolToAPIParamWithCache(t types.Tool) APIToolParam {
+	param := ToolToAPIParam(t)
+	param.CacheControl = &CacheControl{Type: "ephemeral"}
+	return param
 }

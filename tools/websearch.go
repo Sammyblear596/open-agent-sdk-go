@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 // WebSearchTool performs web searches.
 // Note: This is a placeholder — actual implementation requires a search API
-// (e.g., Brave Search, Google Custom Search, or Anthropic's built-in search).
+// (e.g., Brave Search, Google Custom Search, or a built-in search provider).
 type WebSearchTool struct {
 	// SearchFn is a pluggable search implementation.
 	// If nil, the tool returns an error asking to configure a search provider.

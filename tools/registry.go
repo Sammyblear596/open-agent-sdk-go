@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 // Registry manages available tools.

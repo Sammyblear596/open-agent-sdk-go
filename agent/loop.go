@@ -8,10 +8,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/shipany-ai/open-agent-sdk-go/api"
-	agentcontext "github.com/shipany-ai/open-agent-sdk-go/context"
-	"github.com/shipany-ai/open-agent-sdk-go/tools"
-	"github.com/shipany-ai/open-agent-sdk-go/types"
+	"github.com/codeany-ai/open-agent-sdk-go/api"
+	agentcontext "github.com/codeany-ai/open-agent-sdk-go/context"
+	"github.com/codeany-ai/open-agent-sdk-go/tools"
+	"github.com/codeany-ai/open-agent-sdk-go/types"
 )
 
 const defaultSystemPrompt = `You are an AI assistant with access to tools. Use the tools available to you to help the user with their request. Be concise and direct in your responses.`
@@ -62,8 +62,21 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 	}
 	a.messages = append(a.messages, userMsg)
 
-	// Build tool params
+	// Build tool params - filter by allowedTools if specified
 	allTools := a.toolRegistry.All()
+	if len(a.opts.AllowedTools) > 0 {
+		allowedSet := make(map[string]bool, len(a.opts.AllowedTools))
+		for _, name := range a.opts.AllowedTools {
+			allowedSet[name] = true
+		}
+		var filtered []types.Tool
+		for _, t := range allTools {
+			if allowedSet[t.Name()] {
+				filtered = append(filtered, t)
+			}
+		}
+		allTools = filtered
+	}
 	apiTools := make([]api.APIToolParam, len(allTools))
 	for i, t := range allTools {
 		apiTools[i] = api.ToolToAPIParam(t)
@@ -103,6 +116,21 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			System:   apiSystemBlocks,
 			Messages: apiMessages,
 			Tools:    apiTools,
+		}
+
+		// Extended thinking
+		if a.opts.Thinking != nil && a.opts.Thinking.Type == "enabled" {
+			req.Thinking = &api.ThinkingConfig{
+				Type:         "enabled",
+				BudgetTokens: a.opts.Thinking.BudgetTokens,
+			}
+		}
+
+		// Structured output (JSON schema)
+		if a.opts.JSONSchema != nil {
+			req.ToolChoice = map[string]interface{}{
+				"type": "any",
+			}
 		}
 
 		streamEvents, streamErr := a.apiClient.CreateMessageStream(ctx, req)
@@ -210,6 +238,34 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			Timestamp: time.Now(),
 		}
 		a.messages = append(a.messages, toolResultMsg)
+
+		// Emit tool result events so SSE consumers can display them
+		for _, result := range results {
+			content := result.Result.Content
+			var textContent string
+			for _, c := range content {
+				if c.Type == types.ContentBlockText {
+					textContent += c.Text
+				}
+			}
+			eventCh <- types.SDKMessage{
+				Type: "tool_result",
+				Text: textContent,
+				Usage: &types.Usage{},
+				Message: &types.Message{
+					Type: "tool_result",
+					Role: "tool",
+					Content: []types.ContentBlock{
+						{
+							Type:      types.ContentBlockToolResult,
+							ToolUseID: result.ToolUseID,
+							Content:   content,
+							IsError:   result.Result.IsError,
+						},
+					},
+				},
+			}
+		}
 	}
 
 	// Emit result
@@ -318,15 +374,54 @@ func (a *Agent) processStreamEvent(event api.StreamEvent, msg *types.Message, to
 }
 
 // buildAPIMessages converts internal messages to API format.
+// Normalizes content blocks to only include fields required by the API.
 func (a *Agent) buildAPIMessages() []api.APIMessage {
 	var apiMsgs []api.APIMessage
 
 	for _, msg := range a.messages {
-		apiMsg := api.APIMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
+		var normalized []types.ContentBlock
+		for _, block := range msg.Content {
+			switch block.Type {
+			case types.ContentBlockText:
+				normalized = append(normalized, types.ContentBlock{
+					Type: types.ContentBlockText,
+					Text: block.Text,
+				})
+			case types.ContentBlockToolUse:
+				input := block.Input
+				if input == nil {
+					input = map[string]interface{}{}
+				}
+				normalized = append(normalized, types.ContentBlock{
+					Type:  types.ContentBlockToolUse,
+					ID:    block.ID,
+					Name:  block.Name,
+					Input: input,
+				})
+			case types.ContentBlockToolResult:
+				tb := types.ContentBlock{
+					Type:      types.ContentBlockToolResult,
+					ToolUseID: block.ToolUseID,
+					IsError:   block.IsError,
+				}
+				// Flatten content to text for the API
+				if len(block.Content) > 0 {
+					tb.Content = block.Content
+				}
+				normalized = append(normalized, tb)
+			case types.ContentBlockThinking:
+				normalized = append(normalized, types.ContentBlock{
+					Type:     types.ContentBlockThinking,
+					Thinking: block.Thinking,
+				})
+			default:
+				normalized = append(normalized, block)
+			}
 		}
-		apiMsgs = append(apiMsgs, apiMsg)
+		apiMsgs = append(apiMsgs, api.APIMessage{
+			Role:    msg.Role,
+			Content: normalized,
+		})
 	}
 
 	return apiMsgs

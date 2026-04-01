@@ -1,4 +1,4 @@
-module github.com/shipany-ai/open-agent-sdk-go
+module github.com/codeany-ai/open-agent-sdk-go
 
 go 1.23.0
 
