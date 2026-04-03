@@ -40,6 +40,9 @@ type Options struct {
 	// API base URL override
 	BaseURL string
 
+	// API provider: "anthropic" or "openai" (auto-detected if empty)
+	Provider string
+
 	// Working directory for tools
 	CWD string
 
@@ -126,6 +129,7 @@ func New(opts Options) *Agent {
 		APIKey:        opts.APIKey,
 		BaseURL:       opts.BaseURL,
 		Model:         opts.Model,
+		Provider:      api.Provider(opts.Provider),
 		CustomHeaders: opts.CustomHeaders,
 		ProxyURL:      opts.ProxyURL,
 		TimeoutMs:     opts.TimeoutMs,
